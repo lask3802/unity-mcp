@@ -47,7 +47,7 @@ namespace MCPForUnity.Editor.Tools.Prefabs
                     case ACTION_CLOSE_STAGE:
                         return CloseStage(@params);
                     case ACTION_SAVE_OPEN_STAGE:
-                        return SaveOpenStage();
+                        return SaveOpenStage(@params);
                     case ACTION_CREATE_FROM_GAMEOBJECT:
                         return CreatePrefabFromGameObject(@params);
                     case ACTION_GET_INFO:
@@ -128,8 +128,9 @@ namespace MCPForUnity.Editor.Tools.Prefabs
 
         /// <summary>
         /// Saves changes to the currently open prefab stage.
+        /// Supports a 'force' parameter for automated workflows where isDirty may not be set.
         /// </summary>
-        private static object SaveOpenStage()
+        private static object SaveOpenStage(JObject @params)
         {
             PrefabStage stage = PrefabStageUtility.GetCurrentPrefabStage();
             if (stage == null)
@@ -142,9 +143,19 @@ namespace MCPForUnity.Editor.Tools.Prefabs
                 return new ErrorResponse("Prefab stage validation failed. Cannot save.");
             }
 
+            // Check for force parameter (useful for automated workflows)
+            bool force = @params?["force"]?.ToObject<bool>() ?? false;
+
+            // Check if there are actual changes to save
+            bool wasDirty = stage.scene.isDirty;
+            if (!wasDirty && !force)
+            {
+                return new SuccessResponse($"Prefab stage for '{stage.assetPath}' has no unsaved changes.", SerializeStage(stage));
+            }
+
             try
             {
-                SaveAndRefreshStage(stage);
+                SaveAndRefreshStage(stage, force);
                 return new SuccessResponse($"Saved prefab stage for '{stage.assetPath}'.", SerializeStage(stage));
             }
             catch (Exception e)
@@ -157,33 +168,18 @@ namespace MCPForUnity.Editor.Tools.Prefabs
 
         /// <summary>
         /// Saves the prefab stage and refreshes the asset database.
+        /// Uses PrefabUtility.SaveAsPrefabAsset for reliable prefab saving without dialogs.
         /// </summary>
-        private static void SaveAndRefreshStage(PrefabStage stage)
+        /// <param name="stage">The prefab stage to save.</param>
+        /// <param name="force">If true, marks the prefab dirty before saving to ensure changes are captured.</param>
+        private static void SaveAndRefreshStage(PrefabStage stage, bool force = false)
         {
             if (stage == null)
             {
                 throw new ArgumentNullException(nameof(stage), "Prefab stage cannot be null.");
             }
 
-            SaveStagePrefab(stage);
-
-            // Save all assets to ensure changes persist to disk
-            AssetDatabase.SaveAssets();
-
-            McpLog.Info($"[ManagePrefabs] Successfully saved prefab '{stage.assetPath}'.");
-        }
-
-        /// <summary>
-        /// Saves the prefab stage asset using the correct Unity API (Unity 2021.3+).
-        ///
-        /// When editing in PrefabStage, the prefabContentsRoot is treated as a prefab instance.
-        /// We use SetDirty + SaveAssets pattern which is the correct way to save changes
-        /// made to a prefab that's open in PrefabStage.
-        /// Note: AssetDatabase.SaveAssets() is called by SaveAndRefreshStage after this method.
-        /// </summary>
-        private static void SaveStagePrefab(PrefabStage stage)
-        {
-            if (stage?.prefabContentsRoot == null)
+            if (stage.prefabContentsRoot == null)
             {
                 throw new InvalidOperationException("Cannot save prefab stage without a prefab root.");
             }
@@ -193,10 +189,38 @@ namespace MCPForUnity.Editor.Tools.Prefabs
                 throw new InvalidOperationException("Prefab stage has invalid asset path.");
             }
 
-            // Mark the prefab as modified so Unity knows it needs to be saved
-            EditorUtility.SetDirty(stage.prefabContentsRoot);
+            // When force=true, mark the prefab root dirty to ensure changes are saved
+            // This is useful for automated workflows where isDirty may not be set correctly
+            if (force)
+            {
+                EditorUtility.SetDirty(stage.prefabContentsRoot);
+                EditorSceneManager.MarkSceneDirty(stage.scene);
+            }
 
-            McpLog.Info($"[ManagePrefabs] Prefab stage marked dirty: {stage.assetPath}");
+            // Mark all children as dirty to ensure their changes are captured
+            foreach (Transform child in stage.prefabContentsRoot.GetComponentsInChildren<Transform>(true))
+            {
+                if (child != stage.prefabContentsRoot.transform)
+                {
+                    EditorUtility.SetDirty(child.gameObject);
+                }
+            }
+
+            // Use PrefabUtility.SaveAsPrefabAsset which saves without dialogs
+            // This is more reliable for automated workflows than EditorSceneManager.SaveScene
+            bool success;
+            PrefabUtility.SaveAsPrefabAsset(stage.prefabContentsRoot, stage.assetPath, out success);
+
+            if (!success)
+            {
+                throw new InvalidOperationException($"Failed to save prefab asset for '{stage.assetPath}'.");
+            }
+
+            // Ensure changes are persisted to disk
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+
+            McpLog.Info($"[ManagePrefabs] Successfully saved prefab '{stage.assetPath}'.");
         }
 
         /// <summary>
@@ -573,7 +597,7 @@ namespace MCPForUnity.Editor.Tools.Prefabs
             try
             {
                 // Build complete hierarchy items (no pagination)
-                var allItems = BuildHierarchyItems(prefabContents.transform);
+                var allItems = BuildHierarchyItems(prefabContents.transform, sanitizedPath);
 
                 return new SuccessResponse(
                     $"Successfully retrieved prefab hierarchy. Found {allItems.Count} objects.",
@@ -599,17 +623,25 @@ namespace MCPForUnity.Editor.Tools.Prefabs
         /// <summary>
         /// Builds a flat list of hierarchy items from a transform root.
         /// </summary>
-        private static List<object> BuildHierarchyItems(Transform root)
+        /// <param name="root">The root transform of the prefab.</param>
+        /// <param name="mainPrefabPath">Asset path of the main prefab.</param>
+        /// <returns>List of hierarchy items with prefab information.</returns>
+        private static List<object> BuildHierarchyItems(Transform root, string mainPrefabPath)
         {
             var items = new List<object>();
-            BuildHierarchyItemsRecursive(root, "", items);
+            BuildHierarchyItemsRecursive(root, root, mainPrefabPath, "", items);
             return items;
         }
 
         /// <summary>
         /// Recursively builds hierarchy items.
         /// </summary>
-        private static void BuildHierarchyItemsRecursive(Transform transform, string parentPath, List<object> items)
+        /// <param name="transform">Current transform being processed.</param>
+        /// <param name="mainPrefabRoot">Root transform of the main prefab asset.</param>
+        /// <param name="mainPrefabPath">Asset path of the main prefab.</param>
+        /// <param name="parentPath">Parent path for building full hierarchy path.</param>
+        /// <param name="items">List to accumulate hierarchy items.</param>
+        private static void BuildHierarchyItemsRecursive(Transform transform, Transform mainPrefabRoot, string mainPrefabPath, string parentPath, List<object> items)
         {
             if (transform == null) return;
 
@@ -620,9 +652,14 @@ namespace MCPForUnity.Editor.Tools.Prefabs
             int childCount = transform.childCount;
             var componentTypes = PrefabUtilityHelper.GetComponentTypeNames(transform.gameObject);
 
-            // Check if this is a nested prefab root
+            // Prefab information
             bool isNestedPrefab = PrefabUtility.IsAnyPrefabInstanceRoot(transform.gameObject);
-            bool isPrefabRoot = transform == transform.root;
+            bool isPrefabRoot = transform == mainPrefabRoot;
+            int nestingDepth = isPrefabRoot ? 0 : PrefabUtilityHelper.GetPrefabNestingDepth(transform.gameObject, mainPrefabRoot);
+            string parentPrefabPath = isNestedPrefab && !isPrefabRoot
+                ? PrefabUtilityHelper.GetParentPrefabPath(transform.gameObject, mainPrefabRoot)
+                : null;
+            string nestedPrefabPath = isNestedPrefab ? PrefabUtilityHelper.GetNestedPrefabPath(transform.gameObject) : null;
 
             var item = new
             {
@@ -632,9 +669,14 @@ namespace MCPForUnity.Editor.Tools.Prefabs
                 activeSelf = activeSelf,
                 childCount = childCount,
                 componentTypes = componentTypes,
-                isPrefabRoot = isPrefabRoot,
-                isNestedPrefab = isNestedPrefab,
-                nestedPrefabPath = isNestedPrefab ? PrefabUtilityHelper.GetNestedPrefabPath(transform.gameObject) : null
+                prefab = new
+                {
+                    isRoot = isPrefabRoot,
+                    isNestedRoot = isNestedPrefab,
+                    nestingDepth = nestingDepth,
+                    assetPath = isNestedPrefab ? nestedPrefabPath : mainPrefabPath,
+                    parentPath = parentPrefabPath
+                }
             };
 
             items.Add(item);
@@ -642,7 +684,7 @@ namespace MCPForUnity.Editor.Tools.Prefabs
             // Recursively process children
             foreach (Transform child in transform)
             {
-                BuildHierarchyItemsRecursive(child, path, items);
+                BuildHierarchyItemsRecursive(child, mainPrefabRoot, mainPrefabPath, path, items);
             }
         }
 
